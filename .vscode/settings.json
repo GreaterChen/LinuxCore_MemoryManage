@@ -1,8 +1,0 @@
-{
-    "files.associations": {
-        "kernel.h": "c",
-        "errno.h": "c",
-        "sched.h": "c",
-        "config.h": "c"
-    }
-}
