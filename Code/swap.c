@@ -96,9 +96,17 @@ void lru_cache_del(struct page * page)
 /*
  * Perform any setup for the swap system
  */
+//TODO swap_setup
 void __init swap_setup(void)
 {
+	/* 由于读磁盘时先要经过寻道，且寻道是较为费时间的，因此若每次只读指定一个页面并不经济
+		Linux采用一次多读几个界面，称为"预读"，但预读需要更大的内存空间，为了确定一个适当的数量，
+		此函数通过物理内存本身的大小来确定page_cluster参数大小。
+	*/
 	unsigned long megs = num_physpages >> (20 - PAGE_SHIFT);
+	/*
+		PAGE_SHIFT定义于include/asm-ia64/page.h,代表右移多少位能够得到页帧号
+	*/
 
 	/* Use a smaller cluster for small-memory machines */
 	if (megs < 16)

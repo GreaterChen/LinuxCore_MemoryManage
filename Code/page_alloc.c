@@ -21,7 +21,7 @@
 
 int nr_swap_pages;
 int nr_active_pages;
-int nr_inactive_pages;
+int nr_inactive_pages;	// 不活跃的页面，存储在在下面inactive_list队列中
 struct list_head inactive_list;
 struct list_head active_list;
 pg_data_t *pgdat_list;

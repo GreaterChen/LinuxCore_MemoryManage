@@ -939,11 +939,14 @@ static inline void break_cow(struct vm_area_struct * vma, struct page * new_page
  * We hold the mm semaphore and the page_table_lock on entry and exit
  * with the page_table_lock released.
  */
+#TODO do_wp_page
+// 写时复制
 static int do_wp_page(struct mm_struct *mm, struct vm_area_struct * vma,
 	unsigned long address, pte_t *page_table, pte_t pte)
 {
+	/*首先确定复制是否真正需要*/
 	struct page *old_page, *new_page;
-
+	
 	old_page = pte_page(pte);
 	if (!VALID_PAGE(old_page))
 		goto bad_wp_page;
@@ -962,6 +965,9 @@ static int do_wp_page(struct mm_struct *mm, struct vm_area_struct * vma,
 	/*
 	 * Ok, we need to copy. Oh, well..
 	 */
+	// 如果真的需要些，把旧页框的内容复制到新页框中
+	// 然后用新页框的物理地址更新页表的页表项
+	// 并标记新页框为可写和脏页框
 	page_cache_get(old_page);
 	spin_unlock(&mm->page_table_lock);
 
@@ -1104,29 +1110,68 @@ void swapin_readahead(swp_entry_t entry)
 	return;
 }
 
+
+//TODO do_swap_page
 /*
  * We hold the mm semaphore and the page_table_lock on entry and
  * should release the pagetable lock on exit..
  */
+/*
+	函数参数说明：
+	struct mm_struct *mm: mm_struct存储了当前进程的信息比如代码段、数据段的起始地址等，
+	描述了一个进程的整个虚拟地址空间,每个进程只有一个mm_struct
+
+	struct vm_area_struct *vma:内核每次为用户空间中分配一个空间使用时，都会生成一个vm_are_struct结构用于记录跟踪分配情况，
+	一个vm_are_struct就代表一段虚拟内存空间。
+
+	address:映射失败的线性地址
+
+	page_table:映射失败的页面表项的地址.当物理页面在内存中使，页面表项是pte_t结构，指向一个内存页面；
+	当物理页面不在内存中时，是swap_entry_t结构，指向一个盘上页面。
+
+	orig_pte:映射address的页表项内容
+
+	write_access:当映射失败时所进行的访问种类(读/写),是在do_page_fault根据CPU产生的出错代码error_code的bit1决定的
+*/
+
 static int do_swap_page(struct mm_struct * mm,
 	struct vm_area_struct * vma, unsigned long address,
 	pte_t * page_table, pte_t orig_pte, int write_access)
 {
 	struct page *page;
-	swp_entry_t entry = pte_to_swp_entry(orig_pte);
+	swp_entry_t entry = pte_to_swp_entry(orig_pte); // 从orig_pte获得换出页的标识符
 	pte_t pte;
 	int ret = 1;
-
-	spin_unlock(&mm->page_table_lock);
-	page = lookup_swap_cache(entry);
+	spin_unlock(&mm->page_table_lock);	// 释放内存描述符page_table_lock的自旋锁
+	page = lookup_swap_cache(entry);	// 检查对换高速缓存是否以及含有换出页标识符对应的页
+	/*
+		如果没有找到，说明以前用于这个虚存页面的内存页面已经释放，现在其内容仅存在于盘上了
+	*/
 	if (!page) {
-		swapin_readahead(entry);
-		page = read_swap_cache_async(entry);
+		/*
+			由于每次寻道的时间比读取页面的时间长的多，因此每次都会多读几个页面，称为页面集群
+			预读进来的页面都会暂时链入活跃页面队列已经swapper_space的换入/换出队列中，
+			如果实际上确实不不需要，就会由kswapd和kreclaimd在一段时间后回收
+			swapin_readahead()从对换区读取至多2^n个页的一组页，其中包括所请求的页。
+			值n存放在page_cluster变量中，其中的每个页是通过调用read_swap_cache_async()函数读入的
+		*/
+		swapin_readahead(entry);	
+		/*
+			一般来说所需界面以及在活跃页面队列中，只需要把它找到就行了
+			但是如果预读时因为内存不足而失败，就需要再读一次
+			且这次只读取想要的那一个页面
+		*/
+		page = read_swap_cache_async(entry); //再次调用,使当前进程挂起直到该页从磁盘上读出为止
 		if (!page) {
 			/*
 			 * Back out if somebody else faulted in this pte while
 			 * we released the page table lock.
 			 */
+			/*
+				如果请求的页还未加到对换高速缓存，那么另一个内核控制路径可能以及代表这个进程在一个子进程换入了所请求的页
+				可以通过临时获取page_table_lock自旋锁，并把page_table所指向的表项与orig_pte进行比较
+				如果二者有差异，说明这一页已经被某个其他内核线程换入，函数返回1，否则返回-1
+			*/
 			int retval;
 			spin_lock(&mm->page_table_lock);
 			retval = pte_same(*page_table, orig_pte) ? -1 : 1;
@@ -1140,14 +1185,14 @@ static int do_swap_page(struct mm_struct * mm,
 
 	mark_page_accessed(page);
 
-	lock_page(page);
+	lock_page(page);	// 对页加锁
 
 	/*
 	 * Back out if somebody else faulted in this pte while we
 	 * released the page table lock.
 	 */
 	spin_lock(&mm->page_table_lock);
-	if (!pte_same(*page_table, orig_pte)) {
+	if (!pte_same(*page_table, orig_pte)) {	//判断另一个内核控制路径是否代表这个进程的一个子进程换入了所请求的页
 		spin_unlock(&mm->page_table_lock);
 		unlock_page(page);
 		page_cache_release(page);
@@ -1156,7 +1201,7 @@ static int do_swap_page(struct mm_struct * mm,
 
 	/* The page isn't present yet, go ahead with the fault. */
 		
-	swap_free(entry);
+	swap_free(entry);	//减少entry对应页槽的引用计数器
 	if (vm_swap_full())
 		remove_exclusive_swap_page(page);
 
@@ -1166,12 +1211,13 @@ static int do_swap_page(struct mm_struct * mm,
 		pte = pte_mkdirty(pte_mkwrite(pte));
 	unlock_page(page);
 
+	// 后两个函数对于i386来说均为空操作
 	flush_page_to_ram(page);
 	flush_icache_page(vma, page);
 	set_pte(page_table, pte);
 
 	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(vma, address, pte);
+	update_mmu_cache(vma, address, pte);	// 空操作
 	spin_unlock(&mm->page_table_lock);
 	return ret;
 }
@@ -1181,22 +1227,27 @@ static int do_swap_page(struct mm_struct * mm,
  * spinlock held to protect against concurrent faults in
  * multithreaded programs. 
  */
+#TODO do_anonymous_page
 static int do_anonymous_page(struct mm_struct * mm, struct vm_area_struct * vma, pte_t *page_table, int write_access, unsigned long addr)
 {
 	pte_t entry;
 
 	/* Read-only mapping of ZERO_PAGE. */
+	/*
+		在pte_wrprotect()中，把_PAGE_RW标志位置0，表示该物理节目只允许读
+		同时对于读操作，所映射的物理页面总是同一个物理内存界面empty_zero_page，这个页面的内容全为0
+	*/
 	entry = pte_wrprotect(mk_pte(ZERO_PAGE(addr), vma->vm_page_prot));
 
 	/* ..except if it's a write access */
-	if (write_access) {
+	if (write_access) {	// 如果可写
 		struct page *page;
 
 		/* Allocate our own private page. */
 		spin_unlock(&mm->page_table_lock);
-
+		// 只有可写的的页面才通过alloc_page()为其分配独立的物理内存
 		page = alloc_page(GFP_HIGHUSER);
-		if (!page)
+		if (!page)	// 如果分配物理内存失败，跳转至no_mem
 			goto no_mem;
 		clear_user_highpage(page, addr);
 
@@ -1209,14 +1260,15 @@ static int do_anonymous_page(struct mm_struct * mm, struct vm_area_struct * vma,
 		mm->rss++;
 		flush_page_to_ram(page);
 		entry = pte_mkwrite(pte_mkdirty(mk_pte(page, vma->vm_page_prot)));
+		// 下面两个函数将新页框插入到与交换相关的数据结构中
 		lru_cache_add(page);
 		mark_page_accessed(page);
 	}
-
+	// 将分配到的物理界面连同所有的状态以及标志位通过set_pte()这至今指针page_table所指的页面表项
 	set_pte(page_table, entry);
 
 	/* No need to invalidate - it was non-present before */
-	update_mmu_cache(vma, addr, entry);
+	update_mmu_cache(vma, addr, entry);	// 对于i386CPU来说无意义，因为i386的MMU是实现在CPU内部的
 	spin_unlock(&mm->page_table_lock);
 	return 1;	/* Minor fault */
 
@@ -1236,16 +1288,18 @@ no_mem:
  * This is called with the MM semaphore held and the page table
  * spinlock held. Exit with the spinlock released.
  */
+//TODO do_no_page
 static int do_no_page(struct mm_struct * mm, struct vm_area_struct * vma,
 	unsigned long address, int write_access, pte_t *page_table)
 {
 	struct page * new_page;
 	pte_t entry;
 
-	if (!vma->vm_ops || !vma->vm_ops->nopage)
+	if (!vma->vm_ops || !vma->vm_ops->nopage)	// 虚拟区没有映射磁盘文件，是一个匿名映射
 		return do_anonymous_page(mm, vma, page_table, write_access, address);
 	spin_unlock(&mm->page_table_lock);
 
+	// 如果已经被映射为磁盘文件，则vma->vm_ops->nopage指向装入这个页的函数
 	new_page = vma->vm_ops->nopage(vma, address & PAGE_MASK, 0);
 
 	if (new_page == NULL)	/* no page was available -- SIGBUS */
@@ -1322,6 +1376,7 @@ static int do_no_page(struct mm_struct * mm, struct vm_area_struct * vma,
  * We enter with the pagetable spinlock held, we are supposed to
  * release it when done.
  */
+//TODO handle_pte_fault
 static inline int handle_pte_fault(struct mm_struct *mm,
 	struct vm_area_struct * vma, unsigned long address,
 	int write_access, pte_t * pte)
@@ -1329,20 +1384,26 @@ static inline int handle_pte_fault(struct mm_struct *mm,
 	pte_t entry;
 
 	entry = *pte;
-	if (!pte_present(entry)) {
+	/*
+		被寻址的页不在主存中的情况分为：
+		（1）进程从未访问此页，此时页表相应的表项被填充为0，pte_none宏返回1
+		（2）进程访问过这个页，但这个页的内容被临时保存在磁盘上，
+			 此时页表相应表项没有被填充为0，但由于页面不在物理内存中，Present为0
+	*/
+	if (!pte_present(entry)) {	// 检测该页不在内存中
 		/*
 		 * If it truly wasn't present, we know that kswapd
 		 * and the PTE updates will not touch it later. So
 		 * drop the lock.
 		 */
-		if (pte_none(entry))
-			return do_no_page(mm, vma, address, write_access, pte);
-		return do_swap_page(mm, vma, address, pte, entry, write_access);
+		if (pte_none(entry))	// 检测内存页面是否被分配
+			return do_no_page(mm, vma, address, write_access, pte);	//从未被访问
+		return do_swap_page(mm, vma, address, pte, entry, write_access);	//被访问过
 	}
 
-	if (write_access) {
+	if (write_access) {	// 如果是可以写的
 		if (!pte_write(entry))
-			return do_wp_page(mm, vma, address, pte, entry);
+			return do_wp_page(mm, vma, address, pte, entry);	//完成对页面的写入操作
 
 		entry = pte_mkdirty(entry);
 	}
@@ -1355,6 +1416,13 @@ static inline int handle_pte_fault(struct mm_struct *mm,
 /*
  * By the time we get here, we already hold the mm semaphore
  */
+//TODO handle_mm_fault
+/*
+	mm：指向异常发生时正在CPU上运行的内存描述符
+	vma：指向引起异常的线性地址所在线性区的描述符
+	address：引起异常的线性地址
+	write_access：如果tsk试图向address写，则置为1，如果tsk试图在address读或者执行，则值为0
+*/
 int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct * vma,
 	unsigned long address, int write_access)
 {
@@ -1362,16 +1430,27 @@ int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct * vma,
 	pmd_t *pmd;
 
 	current->state = TASK_RUNNING;
-	pgd = pgd_offset(mm, address);
+	pgd = pgd_offset(mm, address);	// 宏操作，计算出指向该地址所属页面目录项的指针
 
 	/*
 	 * We need the page table lock to synchronize with kswapd
 	 * and the SMP-safe atomic PTE updates.
 	 */
-	spin_lock(&mm->page_table_lock);
+	spin_lock(&mm->page_table_lock);	// 页表锁
+	/*
+		pmd_alloc()本来是分配一个中间目录项的，但由于i386只使用两层映射
+		CPU把具体的目录项当成一个只含一个表项的中间目录
+		因此此处不可能失败
+	*/
 	pmd = pmd_alloc(mm, pgd, address);
 
 	if (pmd) {
+		/*
+			pte_alloc()作用为：
+			若相应的目录项已经指向一个页面表，会根据给定的地址在表中找到相应的页面表项
+			若目录项未空，则先分配一个页面表，再在页面表中找到相应的表项
+			为下面分配物理内存界面并建立映射做好准备 
+		*/
 		pte_t * pte = pte_alloc(mm, pmd, address);
 		if (pte)
 			return handle_pte_fault(mm, vma, address, write_access, pte);
