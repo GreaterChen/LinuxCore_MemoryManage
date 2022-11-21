@@ -21,7 +21,7 @@
 
 int nr_swap_pages;
 int nr_active_pages;
-int nr_inactive_pages;	// 不活跃的页面，存储在在下面inactive_list队列中
+int nr_inactive_pages;
 struct list_head inactive_list;
 struct list_head active_list;
 pg_data_t *pgdat_list;
@@ -63,9 +63,31 @@ static int zone_balance_max[MAX_NR_ZONES] __initdata = { 255 , 255, 255, };
  */
 
 static void FASTCALL(__free_pages_ok (struct page *page, unsigned int order));
+
+// 这才是对页面块进行释放的实际函数！
 static void __free_pages_ok (struct page *page, unsigned int order)
 {
+	/*
+		函数说明：
+			函数把释放的页面块链入空闲链表，并对伙伴系统的位图进行管理，必要时合并伙伴块。
+			实际上是expand()函数的反操作。
+	*/
 	unsigned long index, page_idx, mask, flags;
+
+	/*
+		free_area_t 就是 free_area_struct 数据结构
+		typedef struct free_area_struct {
+	
+			struct list_head {
+				struct list_head *next, *prev;
+			};
+	
+			struct list_head	free_list;
+			unsigned long		*map;
+
+		} free_area_t;
+	
+	*/
 	free_area_t *area;
 	struct page *base;
 	zone_t *zone;
@@ -92,6 +114,7 @@ static void __free_pages_ok (struct page *page, unsigned int order)
 		BUG();
 	page->flags &= ~((1<<PG_referenced) | (1<<PG_dirty));
 
+	// 需要释放1个页面到进程的local_pages中
 	if (current->flags & PF_FREE_PAGES)
 		goto local_freelist;
  back_local_freelist:
@@ -99,23 +122,40 @@ static void __free_pages_ok (struct page *page, unsigned int order)
 	zone = page->zone;
 
 	mask = (~0UL) << order;
+
+	// 该管理zone所有4k页面的起始mem_map虚拟地址
 	base = zone->zone_mem_map;
 	page_idx = page - base;
 	if (page_idx & ~mask)
 		BUG();
+	
+	// 使用buddy算法,求得该page对应的map管理位图值索引(page_idx >> order)/2
 	index = page_idx >> (1 + order);
 
+	//获取该zone对应的free_area[order]
 	area = zone->free_area + order;
 
 	spin_lock_irqsave(&zone->lock, flags);
 
+	// 将释放的空闲页数目,加到该zone的free_pages中去
 	zone->free_pages -= mask;
 
+	// 升级的最多次数为10次
 	while (mask + (1 << (MAX_ORDER-1))) {
 		struct page *buddy1, *buddy2;
 
 		if (area >= zone->free_area + MAX_ORDER)
 			BUG();
+		
+		/*
+			__test_and_change_bit()函数
+			
+			功能：对index进行(^)异或运算,返回0,表示伙伴不在当前area内,或序伙伴忙,或许伙伴被拆到了其他area空闲着
+
+			这个函数实现异或并返回原来的值：
+				0 表示原来处于相同的状态，现在处于不同的状态；
+				1 表示原来处于不同的状态，现在处于相同的状态；
+		*/
 		if (!__test_and_change_bit(index, area->map))
 			/*
 			 * the buddy page is still allocated.
@@ -124,6 +164,9 @@ static void __free_pages_ok (struct page *page, unsigned int order)
 		/*
 		 * Move the buddy up one level.
 		 */
+
+		// 如果现在处于相同状态则找到buddy并进行合并，将合并后的块升级到下一个free_area中。
+		// 求得它的伙伴对应的struct page单元,对边界位(1<<order)进行异或操作
 		buddy1 = base + (page_idx ^ -mask);
 		buddy2 = base + page_idx;
 		if (BAD_RANGE(zone,buddy1))
@@ -131,13 +174,13 @@ static void __free_pages_ok (struct page *page, unsigned int order)
 		if (BAD_RANGE(zone,buddy2))
 			BUG();
 
-		memlist_del(&buddy1->list);
-		mask <<= 1;
-		area++;
+		memlist_del(&buddy1->list);		// 将合并后的块从目前层级的free_area中删除
+		mask <<= 1;						//计算升级后的mask
+		area++;							//指向升级后的area
 		index >>= 1;
-		page_idx &= mask;
+		page_idx &= mask;				//调整page_idx成(1<<order)页对齐,即:调整page_idx成伙伴中"比较小的那个小伙伴"对应的地址
 	}
-	memlist_add_head(&(base + page_idx)->list, &area->free_list);
+	memlist_add_head(&(base + page_idx)->list, &area->free_list);	//将经过Buddy伙伴合并后的页,添加到相应order对应的area对应的free_list中
 
 	spin_unlock_irqrestore(&zone->lock, flags);
 	return;
@@ -153,56 +196,98 @@ static void __free_pages_ok (struct page *page, unsigned int order)
 	current->nr_local_pages++;
 }
 
+// 位图操作宏定义
 #define MARK_USED(index, order, area) \
 	__change_bit((index) >> (1+(order)), (area)->map)
 
 static inline struct page * expand (zone_t *zone, struct page *page,
 	 unsigned long index, int low, int high, free_area_t * area)
 {
-	unsigned long size = 1 << high;
+	/*
+		参数：
+			zone	指向已分配页块所在的管理区
+			page	指向已分配的页块
+			index	已分配的页块在mem_map中的下标
+			low		所需物理块大小的order 即 2^low
+			high	当前空闲区队列（也就是从中得到能满足要求的物理块的队列）的 curr_order
+			area	指向实际分配的页块
+	*/
+	unsigned long size = 1 << high;		// 得到大小 幂次
 
+	// high不可能小于low;  如果high等于low, 就跳过这个循环了; 否则进入循环
+	// 当 high == low, 循环结束
 	while (high > low) {
 		if (BAD_RANGE(zone,page))
 			BUG();
+		
+		// 将物理块链入低一档（也就是物理块大小减半）的空闲队列中去
 		area--;
 		high--;
-		size >>= 1;
-		memlist_add_head(&(page)->list, &(area)->free_list);
-		MARK_USED(index, high, area);
+		size >>= 1;		// ➗2 大小减半
+		memlist_add_head(&(page)->list, &(area)->free_list);	// 头插
+		MARK_USED(index, high, area);	// 设置位图
+
+		// 以后半部分作为新的物理块，开始下一轮循环，也就是处理更低一档的空闲块队列
 		index += size;
 		page += size;
 	}
+
 	if (BAD_RANGE(zone,page))
 		BUG();
+
 	return page;
 }
 
 static FASTCALL(struct page * rmqueue(zone_t *zone, unsigned int order));
 static struct page * rmqueue(zone_t *zone, unsigned int order)
 {
+	/*
+		参数：
+			zone 管理区
+			order 需要分配的页面大小，表示分配页面数为 2^order 
+	*/
+
+	// zone->free_area是个结构数组，代表不同大小的空闲区的头，使用zone->free_area + order获取数组的下标，指向链接所需大小的物理内存块的队列头
 	free_area_t * area = zone->free_area + order;
 	unsigned int curr_order = order;
 	struct list_head *head, *curr;
 	unsigned long flags;
 	struct page *page;
 
+	// 分配页面时候，把page从双向链中摘除，这个过程是不能允许其他的进程、处理器来打扰的，所以要给相应的分区加上锁。
 	spin_lock_irqsave(&zone->lock, flags);
+
+	// 主要操作在 do-while 结构中进行
+	/*
+		大体流程：
+			1、首先在恰好满足要求的队列里分配，不行就试试更大的内存块的队列
+			2、如果大的成功了，就把分配到的大块 的剩余部分 分解成小块，链入相应的队列中 (expand函数)
+	*/
 	do {
-		head = &area->free_list;
-		curr = memlist_next(head);
+		head = &area->free_list;	// head指向当前order大小区域的链表头
+		curr = memlist_next(head);	// 指向head下一个 <宏定义>
 
 		if (curr != head) {
 			unsigned int index;
 
+			// memlist_entry() 实际上用的是 list_entry()
+			//  -> 这里将一个list_head指针curr换算成宿主结构的起始地址，也就是取得指向其宿主page结构的指针
+			//     -> curr是一个page结构内部的成分list的地址，想要获得宿主地址，也就是用当前地址减去list在page内部的偏移量
 			page = memlist_entry(curr, struct page, list);
+
 			if (BAD_RANGE(zone,page))
 				BUG();
+
+			// memlist_del() 实际上用的是 list_del(), 作用是把这个page元素从队列中摘除
 			memlist_del(curr);
+			// 如果某个页面块被分配出去，就要在 frea_area 的位图中进行标记，这是通过调用 MARK_USED（）宏来完成的。
 			index = page - zone->zone_mem_map;
 			if (curr_order != MAX_ORDER-1)
 				MARK_USED(index, curr_order, area);
+			// 更新一下free_pages大小
 			zone->free_pages -= 1UL << order;
 
+			// 如果分配出去后还有剩余块，就通过 expand（）获得所分配的页块，而把剩余块链入适当的空闲队列中。
 			page = expand(zone, page, index, order, curr_order, area);
 			spin_unlock_irqrestore(&zone->lock, flags);
 
@@ -215,17 +300,23 @@ static struct page * rmqueue(zone_t *zone, unsigned int order)
 				BUG();
 			return page;	
 		}
+		// 不断向上扫描，直到成功或者最终失败
 		curr_order++;
 		area++;
-	} while (curr_order < MAX_ORDER);
+	} while (curr_order < MAX_ORDER);	// 不断向上扫描，直到成功或者最终失败
 	spin_unlock_irqrestore(&zone->lock, flags);
 
 	return NULL;
 }
 
+/*
+这个函数只在CONFIG_DISCONTIGMEM无定义的时候才得到编译（与NUMA结构的alloc_pages相反）
+*/
+
 #ifndef CONFIG_DISCONTIGMEM
 struct page *_alloc_pages(unsigned int gfp_mask, unsigned int order)
 {
+	// 下面这个是具体的页面分配函数
 	return __alloc_pages(gfp_mask, order,
 		contig_page_data.node_zonelists+(gfp_mask & GFP_ZONEMASK));
 }
@@ -310,32 +401,60 @@ static struct page * balance_classzone(zone_t * classzone, unsigned int gfp_mask
  */
 struct page * __alloc_pages(unsigned int gfp_mask, unsigned int order, zonelist_t *zonelist)
 {
+	/*
+		参数：
+			gfp_mask 分配策略
+			order 分配大小，可以是1, 2, 4, 8, ...., 2^max_order
+			zonelist 所有区
+	*/
 	unsigned long min;
 	zone_t **zone, * classzone;
 	struct page * page;
 	int freed;
 
+	// 这里获取了所有的管理区
 	zone = zonelist->zones;
 	classzone = *zone;
+	// “低水位”初始化, UL = unsigned long  幂次操作<<  这里也就是需要的空间大小 2^order
 	min = 1UL << order;
+	/*
+		循环遍历管理区，如果 没了/成功 就退出；
+		条件是： 如果rmqueue()失败，那就继续到 分配策略规定的 下一个管理区找
+	*/
 	for (;;) {
 		zone_t *z = *(zone++);
 		if (!z)
 			break;
 
+		// 更新“水位线”
 		min += z->pages_low;
+		// 如果这个区 有可用空间，就调用rmqueue()函数，试图从该管理区中分配
 		if (z->free_pages > min) {
+			// rmqueue函数：试图从一个页面管理区分配若干连续的内存页面
 			page = rmqueue(z, order);
 			if (page)
 				return page;
 		}
 	}
 
+
+	/*
+		如果发现管理区中的空闲页面总量已经降到最低点，则把 zone_t 结构中需要重新平衡
+		的标志（need_balance）置 1，而且如果内核线程 kswapd 在一个等待队列中睡眠，就唤醒它，
+		让它收回一些页面以备使用
+		
+		<need_balance 是和 kswapd 配合使用的>
+	*/
 	classzone->need_balance = 1;
 	mb();
 	if (waitqueue_active(&kswapd_wait))
 		wake_up_interruptible(&kswapd_wait);
 
+
+	/*
+		再次尝试！
+		如果给定分配策略中所有页面管理区都分配失败,那就把原来的最低水位除以4下调.看能否满足要求,可以满足调用rmqueue分配并返回
+	*/
 	zone = zonelist->zones;
 	min = 1UL << order;
 	for (;;) {
@@ -346,7 +465,7 @@ struct page * __alloc_pages(unsigned int gfp_mask, unsigned int order, zonelist_
 
 		local_min = z->pages_min;
 		if (!(gfp_mask & __GFP_WAIT))
-			local_min >>= 2;
+			local_min >>= 2;		// ➗4
 		min += local_min;
 		if (z->free_pages > min) {
 			page = rmqueue(z, order);
@@ -358,6 +477,12 @@ struct page * __alloc_pages(unsigned int gfp_mask, unsigned int order, zonelist_
 	/* here we're in the low on memory slow path */
 
 rebalance:
+	/*
+		PF_MEMALLOC		allocating memory
+		PF_MEMDIE		killed out of memory
+		看是哪类进程在请求分配页面， 如果是上述两类， 那么必须给进程分配页面！
+		继续尝试分配！
+	*/
 	if (current->flags & (PF_MEMALLOC | PF_MEMDIE)) {
 		zone = zonelist->zones;
 		for (;;) {
@@ -373,13 +498,20 @@ rebalance:
 	}
 
 	/* Atomic allocations - we can't balance anything */
+	// 如果请求分配页面的进程不能等待，也不能被重新调度，只好在没有分配到页面的情况下“空手”返回。
 	if (!(gfp_mask & __GFP_WAIT))
 		return NULL;
 
+	/*
+		如果必须要得到页面的进程还还是没分配到页面,就要调用
+		balance_classzone（）函数把当前进程所占有的局部页面释放出来。如果释放成功，则返回
+		一个 page 结构指针，指向页面块中第一个页面的起始地址。
+	*/
 	page = balance_classzone(classzone, gfp_mask, order, &freed);
 	if (page)
 		return page;
 
+	// 然后继续分配页面！
 	zone = zonelist->zones;
 	min = 1UL << order;
 	for (;;) {
@@ -435,7 +567,7 @@ unsigned long get_zeroed_page(unsigned int gfp_mask)
 void __free_pages(struct page *page, unsigned int order)
 {
 	if (!PageReserved(page) && put_page_testzero(page))
-		__free_pages_ok(page, order);
+		__free_pages_ok(page, order);	// 连续页框的释放
 }
 
 void free_pages(unsigned long addr, unsigned int order)

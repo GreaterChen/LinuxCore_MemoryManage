@@ -1,6 +1,7 @@
 {
     "files.associations": {
-        "swap.h": "c"
+        "swap.h": "c",
+        "xutility": "c"
     },
     "todo-tree.tree.scanMode": "current file"
 }

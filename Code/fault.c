@@ -24,7 +24,8 @@
 #include <asm/pgalloc.h>
 #include <asm/hardirq.h>
 
-extern void die(const char *,struct pt_regs *,long);
+
+extern void die(const char *,struct pt_regs *,long);	// 内核缺陷导致的强制杀死进程
 
 /*
  * Ugly, ugly, but the goto's result in better assembly..
@@ -37,14 +38,14 @@ int __verify_write(const void * addr, unsigned long size)
 	if (!size)
 		return 1;
 
-	vma = find_vma(current->mm, start);
+	vma = find_vma(current->mm, start);	//查找addr后面的第一个虚拟地址空间
 	if (!vma)
-		goto bad_area;
-	if (vma->vm_start > start)
+		goto bad_area;	// 如果没有
+	if (vma->vm_start > start)	// 如果寻址的点在外面
 		goto check_stack;
 
 good_area:
-	if (!(vma->vm_flags & VM_WRITE))
+	if (!(vma->vm_flags & VM_WRITE))	// 如果不能写
 		goto bad_area;
 	size--;
 	size += start & ~PAGE_MASK;
@@ -84,7 +85,7 @@ bad_area:
 	return 0;
 
 out_of_memory:
-	if (current->pid == 1) {
+	if (current->pid == 1) {	// 如果是初始进程
 		current->policy |= SCHED_YIELD;
 		schedule();
 		goto survive;
@@ -152,7 +153,7 @@ extern unsigned long idt;
 //TODO do_page_fault
 asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 {
-	struct task_struct *tsk;
+	struct task_struct *tsk;	// task_Struct是包含所有进程信息的结构体
 	struct mm_struct *mm;
 	struct vm_area_struct * vma;
 	unsigned long address;
@@ -182,11 +183,11 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 		goto vmalloc_fault;
 
 	mm = tsk->mm;
-	info.si_code = SEGV_MAPERR;
+	info.si_code = SEGV_MAPERR;	 // 堆栈映射错误（由一个不存在的页框引起）
 
 	
 	/*in_interrupt返回非0说明映射的失败发生在某个中断服务程序中，与当前进程毫无关系
-	  mm指针为空代表映射尚未建立，自然与当前进程没有关系
+	  mm指针为空代表在执行内核线程（对内核线程而言，进程描述符的mm字段总为NULL）
 	*/
 	if (in_interrupt() || !mm) 
 		goto no_context;
@@ -196,13 +197,14 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	down_read(&mm->mmap_sem); 
 
 	/*
-	至此已经知道了发生映射失败的地址以及所属的进程，接下来需要清楚该地址落在哪个区间
+	至此已经知道了缺页没有发生在中断处理程序或者内核线程
+	且我们得到了发生映射失败的地址以及所属的进程，接下来需要检查进程所拥有的线性区以判断引起缺页的线性地址是否包含于进程的地址空间
 	find_vma()试图在一个虚存空间中找出地址大于给定地址的第一个区间
 	其返回struct vm_area_struct类型指针，该指针指向描述进程中虚拟地址addr所在虚拟区间的结构体
 	如果找不到，此次页面异常就是因为越界访问引起的
 	*/
 	vma = find_vma(mm, address);
-	if (!vma)	// 不存在，说明访问了非法虚地址
+	if (!vma)	// 不存在，address之后没有线性区，说明访问了非法地址
 		goto bad_area;
 	if (vma->vm_start <= address)	// 如果找到了区间，且起始地址不高于给定的地址，说明给定的地址恰好落在该区间
 		goto good_area;
@@ -234,25 +236,25 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
  * we can handle it..
  */
 
-// 细分error_code种类
+// 说明确实是正常的缺页没调入，细分error_code种类
 good_area:
-	info.si_code = SEGV_ACCERR;
+	info.si_code = SEGV_ACCERR;	// 由于对现有的页框无效访问引起
 	write = 0;
-	switch (error_code & 3) {
+	switch (error_code & 3) {	// 除了x00都行：缺页&只读 
 		default:	/* 3: write, present */
 #ifdef TEST_VERIFY_AREA
 			if (regs->cs == KERNEL_CS)
 				printk("WP fault at %08lx\n", regs->eip);
 #endif
 			/* fall through */
-		case 2:		//   010&011，内核态写操作
+		case 2:		//   010&011,错误由写访问引起
 			if (!(vma->vm_flags & VM_WRITE))	// 若不允许写入
 				goto bad_area;
-			write++;
+			write++;	// 若可写，写信号+1
 			break;
-		case 1:		// 保护态
+		case 1:		// 001&011，错误由无效的访问权限引起
 			goto bad_area;
-		case 0:		/* read, not present */
+		case 0:		// 000 只读
 			if (!(vma->vm_flags & (VM_READ | VM_EXEC)))	// 可读 | 可执行
 				goto bad_area;
 	}
@@ -272,7 +274,7 @@ good_area:
 		break;
 	case 0:	// 其他错误跳转到do_sigbus
 		goto do_sigbus;
-	default:	// 没有足够的内存
+	default:	// 分配页框失败
 		goto out_of_memory;
 	}
 
@@ -292,19 +294,20 @@ good_area:
  * Something tried to access memory that isn't in our memory map..
  * Fix it, but check if it's kernel or user first..
  */
+// 多种情况跳转过来，总之就是不属于进程地址空间
 bad_area:
 	up_read(&mm->mmap_sem);	// 释放mmap_sem信号量
 
 	/* User mode accesses just cause a SIGSEGV */
-	if (error_code & 4) {	// 若是在用户模式
+	if (error_code & 4) {	// 若是在用户态
 		tsk->thread.cr2 = address;
 		tsk->thread.error_code = error_code;
 		tsk->thread.trap_no = 14;
 		info.si_signo = SIGSEGV;	// 代表异常是由于一个不存在的页框引起
 		info.si_errno = 0;
-		/* info.si_code has been set above */
+		/* info.si_code has been set above */	// 上面已经把info.si_code设置为SEGV_MAPERR或SEGV_ACCERR
 		info.si_addr = (void *)address;
-		force_sig_info(SIGSEGV, &info, tsk);	//给当前进程发杀死信号
+		force_sig_info(SIGSEGV, &info, tsk);	//给当前进程发杀死信号同时确信进程不忽略或阻塞此信号
 		return;
 		//在用户态转向bad_area的处理到此为止
 	}
@@ -312,6 +315,7 @@ bad_area:
 	/*
 	 * Pentium F0 0F C7 C8 bug workaround.
 	 */
+	// 解决Pentium设计时的严重bug
 	if (boot_cpu_data.f00f_bug) {
 		unsigned long nr;
 		
@@ -322,9 +326,18 @@ bad_area:
 			return;
 		}
 	}
-
+/*
+	异常发生在内核态的两种可能：
+		1.异常的引起是由于把某个线性地址作为系统调用的参数传递给内核
+		2.异常是因一个真正的内核缺陷造成
+*/
 no_context:
 	/* Are we prepared to handle this kernel fault?  */
+	/*
+		通过发生缺页异常的指令regs->eip在异常表(exception table)中寻找下一条可以继续运行的指令(fixup)
+		如果查找成果(返回结果不为0)，将堆栈中的返回地址修改成修复地址并返回
+		随后发生异常的进程按fixup中安排好的指令继续执行下去
+	*/
 	if ((fixup = search_exception_table(regs->eip)) != 0) {
 		regs->eip = fixup;
 		return;
@@ -334,9 +347,10 @@ no_context:
  * Oops. The kernel tried to access some bad page. We'll have to
  * terminate things with extreme prejudice.
  */
+    // 内核设计缺陷！
 
-	bust_spinlocks(1);
-
+	bust_spinlocks(1);	// 保留现场
+	// 打印此时的相关信息，需要人工查找问题了
 	if (address < PAGE_SIZE)
 		printk(KERN_ALERT "Unable to handle kernel NULL pointer dereference");
 	else
@@ -361,6 +375,7 @@ no_context:
  * We ran out of memory, or some other thing happened to us that made
  * us unable to handle the page fault gracefully.
  */
+/*界面创建失败*/
 out_of_memory:
 	up_read(&mm->mmap_sem);
 	if (tsk->pid == 1) {	// 如果是最初始的init进程
@@ -381,6 +396,7 @@ do_sigbus:
 	 * Send a sigbus, regardless of whether we were in kernel
 	 * or user mode.
 	 */
+	// 发送SIGBUS信号
 	tsk->thread.cr2 = address;
 	tsk->thread.error_code = error_code;
 	tsk->thread.trap_no = 14;
@@ -391,6 +407,7 @@ do_sigbus:
 	force_sig_info(SIGBUS, &info, tsk);
 
 	/* Kernel mode? Handle exceptions or die */
+	// 如果在内核态，转向no_context
 	if (!(error_code & 4))
 		goto no_context;
 	return;
