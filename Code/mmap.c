@@ -503,24 +503,24 @@ unsigned long do_mmap_pgoff(struct file * file, unsigned long addr, unsigned lon
 		return -ENODEV;//检查是否为要映射的文件定义了mmap文件操作。如果没有，就返回一个错误码。如果文件操作表的mmap为NULL说明相应的文件不能被映射(例如，这是一个目录).
 
 
-	if ((len = PAGE_ALIGN(len)) == 0)//如果给出的VAM地址空间长度小于页的大小
+	if ((len = PAGE_ALIGN(len)) == 0)//进行页对齐
 		return addr;
 
-	if (len > TASK_SIZE)//检查包含的地址大于TASK_SIZE
+	if (len > TASK_SIZE)//检查包含的地址大于TASK_SIZE（用户空间）
 		return -EINVAL;
 
 	/* offset overflow? */
-	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)//检查是否越界
+	if ((pgoff + (len >> PAGE_SHIFT)) < pgoff)//检查是否越界（在检查页内偏移量是否合法）
 		return -EINVAL;
 
 	/* Too many mappings? */
-	if (mm->map_count > MAX_MAP_COUNT)//进程映射了过多的线性区。
+	if (mm->map_count > MAX_MAP_COUNT)//进程映射了过多的线性区（申请是否超过限制）。
 		return -ENOMEM;
 
 	/* Obtain the address to map to. we verify (or select) it and ensure
 	 * that it represents a valid section of the address space.
 	 */
-	addr = get_unmapped_area(file, addr, len, pgoff, flags);//get_unmapped_area获得新线性区的线性地址区间。
+	addr = get_unmapped_area(file, addr, len, pgoff, flags);//get_unmapped_area获得新线性区的线性地址区间（）。
 	if (addr & ~PAGE_MASK)
 		return addr;
 
@@ -742,7 +742,7 @@ static inline unsigned long arch_get_unmapped_area(struct file *filp, unsigned l
 #else
 extern unsigned long arch_get_unmapped_area(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
 #endif	
-
+/*获得新的线性空间*/
 unsigned long get_unmapped_area(struct file *file, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
 	if (flags & MAP_FIXED) {
@@ -1280,6 +1280,7 @@ out:
 	}
 	return addr;
 }
+
 
 /* Build the RB tree corresponding to the VMA list. */
 /*红黑树*/

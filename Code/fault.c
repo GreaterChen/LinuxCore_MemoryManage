@@ -30,6 +30,7 @@ extern void die(const char *,struct pt_regs *,long);	// 内核缺陷导致的强
 /*
  * Ugly, ugly, but the goto's result in better assembly..
  */
+// 似乎没有用到，不知道有什么用
 int __verify_write(const void * addr, unsigned long size)
 {
 	struct vm_area_struct * vma;
@@ -38,14 +39,14 @@ int __verify_write(const void * addr, unsigned long size)
 	if (!size)
 		return 1;
 
-	vma = find_vma(current->mm, start);	//查找addr后面的第一个虚拟地址空间
+	vma = find_vma(current->mm, start);	//查找addr后面的第一个地址空间
 	if (!vma)
-		goto bad_area;	// 如果没有
-	if (vma->vm_start > start)	// 如果寻址的点在外面
+		goto bad_area;
+	if (vma->vm_start > start)
 		goto check_stack;
 
 good_area:
-	if (!(vma->vm_flags & VM_WRITE))	// 如果不能写
+	if (!(vma->vm_flags & VM_WRITE))	// 如果是写访问异常
 		goto bad_area;
 	size--;
 	size += start & ~PAGE_MASK;
@@ -153,7 +154,7 @@ extern unsigned long idt;
 //TODO do_page_fault
 asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 {
-	struct task_struct *tsk;	// task_Struct是包含所有进程信息的结构体
+	struct task_struct *tsk;	// task_struct是包含所有进程信息的结构体
 	struct mm_struct *mm;
 	struct vm_area_struct * vma;
 	unsigned long address;
@@ -177,12 +178,12 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	*/
 	tsk = current;	
 
-	// !(error_code & 101),当error_code为0x0时为真，代表缺页、在内核态
+	// !(error_code & 101),当error_code为0x0时为真，代表缺页、写访问异常、在内核态
 	// 如果产生缺页的地址>TASK_SIZE(即进入了内核的3-4G空间)且发生在内核态,跳转到vamlloc_fault
 	if (address >= TASK_SIZE && !(error_code & 5)) 
 		goto vmalloc_fault;
 
-	mm = tsk->mm;
+	mm = tsk->mm;	// 获取当前进程的内存信息
 	info.si_code = SEGV_MAPERR;	 // 堆栈映射错误（由一个不存在的页框引起）
 
 	
@@ -204,7 +205,7 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	如果找不到，此次页面异常就是因为越界访问引起的
 	*/
 	vma = find_vma(mm, address);
-	if (!vma)	// 不存在，address之后没有线性区，说明访问了非法地址
+	if (!vma)	// 不存在，说明访问了非法地址
 		goto bad_area;
 	if (vma->vm_start <= address)	// 如果找到了区间，且起始地址不高于给定的地址，说明给定的地址恰好落在该区间
 		goto good_area;
@@ -236,7 +237,7 @@ asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long error_code)
  * we can handle it..
  */
 
-// 说明确实是正常的缺页没调入，细分error_code种类
+// 细分error_code种类继续判断
 good_area:
 	info.si_code = SEGV_ACCERR;	// 由于对现有的页框无效访问引起
 	write = 0;
@@ -269,7 +270,10 @@ good_area:
 	case 1:	// 在没有堵塞当前进程的情况下处理了缺页，这种缺页称为次缺页（minor fault）
 		tsk->min_flt++;
 		break;
-	case 2:	// 缺页迫使当前进程睡眠(可能是由于当用磁盘上的数据填充所分配的页框时花费时间)，阻塞当前进程的缺页叫做主缺页(major fault)
+	case 2:	
+	/*缺页迫使当前进程睡眠(可能是由于当用磁盘上的数据填充所分配的页框时花费时间)，
+	阻塞当前进程的缺页叫做主缺页(major fault)
+	*/
 		tsk->maj_flt++;
 		break;
 	case 0:	// 其他错误跳转到do_sigbus
@@ -327,6 +331,7 @@ bad_area:
 		}
 	}
 /*
+	no_context处理在内核态发生的异常
 	异常发生在内核态的两种可能：
 		1.异常的引起是由于把某个线性地址作为系统调用的参数传递给内核
 		2.异常是因一个真正的内核缺陷造成
@@ -335,7 +340,7 @@ no_context:
 	/* Are we prepared to handle this kernel fault?  */
 	/*
 		通过发生缺页异常的指令regs->eip在异常表(exception table)中寻找下一条可以继续运行的指令(fixup)
-		如果查找成果(返回结果不为0)，将堆栈中的返回地址修改成修复地址并返回
+		如果查找成功(返回结果不为0)，将堆栈中的返回地址修改成修复地址并返回
 		随后发生异常的进程按fixup中安排好的指令继续执行下去
 	*/
 	if ((fixup = search_exception_table(regs->eip)) != 0) {
@@ -412,6 +417,7 @@ do_sigbus:
 		goto no_context;
 	return;
 
+// 总的来说就是如果没出错的话把内核态里页目录项、页表项等信息放到进程中
 vmalloc_fault:
 	{
 		/*
@@ -421,28 +427,33 @@ vmalloc_fault:
 		 * Do _not_ use "tsk" here. We might be inside
 		 * an interrupt in the middle of a task switch..
 		 */
-		int offset = __pgd_offset(address);
+		
+		int offset = __pgd_offset(address);	//页目录项偏移
 		pgd_t *pgd, *pgd_k;
 		pmd_t *pmd, *pmd_k;
 		pte_t *pte_k;
 
-		asm("movl %%cr3,%0":"=r" (pgd));
-		pgd = offset + (pgd_t *)__va(pgd);
-		pgd_k = init_mm.pgd + offset;
+		asm("movl %%cr3,%0":"=r" (pgd));	// 读出当前进程的页全局目录的位置
+		pgd = offset + (pgd_t *)__va(pgd);	// 得到具体的对应于缺页地址的目录项
+		pgd_k = init_mm.pgd + offset;		// 内核页表swapper_pg_dir的偏移处
 
-		if (!pgd_present(*pgd_k))
+		if (!pgd_present(*pgd_k))	// 如果内核页表中不存在
 			goto no_context;
-		set_pgd(pgd, *pgd_k);
+		set_pgd(pgd, *pgd_k);	// 把内核页表swapper_pg_dir中目录项拷贝到用户页表中
 		
-		pmd = pmd_offset(pgd, address);
-		pmd_k = pmd_offset(pgd_k, address);
-		if (!pmd_present(*pmd_k))
-			goto no_context;
-		set_pmd(pmd, *pmd_k);
 
-		pte_k = pte_offset(pmd_k, address);
+		// 在i386中下面对于pmd的操作完全等价于对pgd的操作
+		// 因此i386中下段代码无实际作用
+		pmd = pmd_offset(pgd, address);	// 页表偏移量
+		pmd_k = pmd_offset(pgd_k, address);	// 在swapper_pg_dir的页表偏移量
+		if (!pmd_present(*pmd_k))	// 如果pmd不存在
+			goto no_context;
+		set_pmd(pmd, *pmd_k);	//把内核页表swapper_pg_dir页表向拷贝到用户页表中
+
+		pte_k = pte_offset(pmd_k, address);	// 判断pte项是否存在
 		if (!pte_present(*pte_k))
 			goto no_context;
 		return;
 	}
 }
+

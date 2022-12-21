@@ -25,6 +25,7 @@
 #include <asm/pgtable.h>
 
 /* How many pages do we try to swap or page in/out together? */
+/*页面集群的数量，在__init swap_setup(void)函数中介绍*/
 int page_cluster;
 
 pager_daemon_t pager_daemon = {
@@ -33,22 +34,21 @@ pager_daemon_t pager_daemon = {
 	8,	/* do swap I/O in clusters of this size */
 };
 
-/*
- * Move an inactive page to the active list.
- */
+
+//将页面从不活跃列表移动到活跃列表中
 static inline void activate_page_nolock(struct page * page)
 {
-	if (PageLRU(page) && !PageActive(page)) {
-		del_page_from_inactive_list(page);
-		add_page_to_active_list(page);
+	if (PageLRU(page) && !PageActive(page)) {	// 确保该页面在LRU中，且不在active_list中
+		del_page_from_inactive_list(page);	//从不活跃列表中删除
+		add_page_to_active_list(page);		//加入活跃列表
 	}
 }
 
 void activate_page(struct page * page)
 {
-	spin_lock(&pagemap_lru_lock);
-	activate_page_nolock(page);
-	spin_unlock(&pagemap_lru_lock);
+	spin_lock(&pagemap_lru_lock);	// 加锁
+	activate_page_nolock(page);		// 真正干活的函数
+	spin_unlock(&pagemap_lru_lock);	// 解锁
 }
 
 /**
@@ -59,7 +59,7 @@ void lru_cache_add(struct page * page)
 {
 	if (!TestSetPageLRU(page)) {
 		spin_lock(&pagemap_lru_lock);
-		add_page_to_inactive_list(page);
+		add_page_to_inactive_list(page);	//加入不活跃列表
 		spin_unlock(&pagemap_lru_lock);
 	}
 }
@@ -73,11 +73,11 @@ void lru_cache_add(struct page * page)
  */
 void __lru_cache_del(struct page * page)
 {
-	if (TestClearPageLRU(page)) {
+	if (TestClearPageLRU(page)) {//测试并清除表示该页在LRU中的标志
 		if (PageActive(page)) {
-			del_page_from_active_list(page);
+			del_page_from_active_list(page);	//如果该页面在活跃页面列表中，
 		} else {
-			del_page_from_inactive_list(page);
+			del_page_from_inactive_list(page);	//如果在不活跃页面列表中
 		}
 	}
 }
@@ -88,9 +88,9 @@ void __lru_cache_del(struct page * page)
  */
 void lru_cache_del(struct page * page)
 {
-	spin_lock(&pagemap_lru_lock);
-	__lru_cache_del(page);
-	spin_unlock(&pagemap_lru_lock);
+	spin_lock(&pagemap_lru_lock);	//获取LRU锁
+	__lru_cache_del(page);	//实际的从LRU列表删除页面的工作
+	spin_unlock(&pagemap_lru_lock);	//解锁
 }
 
 /*
